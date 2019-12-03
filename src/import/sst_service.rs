@@ -1,37 +1,30 @@
-// Copyright 2018 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::convert::TryFrom;
 use std::sync::{Arc, Mutex};
 
+use engine::rocks::util::compact_files_in_range;
+use engine::rocks::DB;
 use futures::sync::mpsc;
 use futures::{future, Future, Stream};
 use futures_cpupool::{Builder, CpuPool};
-use grpc::{ClientStreamingSink, RequestStream, RpcContext, UnarySink};
+use grpcio::{ClientStreamingSink, RequestStream, RpcContext, UnarySink};
 use kvproto::import_sstpb::*;
-use kvproto::import_sstpb_grpc::*;
 use kvproto::raft_cmdpb::*;
-use rocksdb::DB;
 
-use raftstore::store::Callback;
-use server::transport::RaftStoreRouter;
-use util::future::paired_future_callback;
-use util::rocksdb::compact_files_in_range;
-use util::time::Instant;
+use crate::raftstore::store::Callback;
+use crate::server::transport::RaftStoreRouter;
+use crate::server::CONFIG_ROCKSDB_GAUGE;
+use engine_rocks::{RocksEngine, RocksIOLimiter};
+use engine_traits::IOLimiter;
+use sst_importer::send_rpc_response;
+use tikv_util::future::paired_future_callback;
+use tikv_util::time::Instant;
 
-use super::import_mode::*;
-use super::metrics::*;
-use super::service::*;
-use super::{Config, Error, SSTImporter};
+use sst_importer::import_mode::*;
+use sst_importer::metrics::*;
+use sst_importer::service::*;
+use sst_importer::{Config, Error, SSTImporter};
 
 /// ImportSSTService provides tikv-server with the ability to ingest SST files.
 ///
@@ -45,6 +38,7 @@ pub struct ImportSSTService<Router> {
     threads: CpuPool,
     importer: Arc<SSTImporter>,
     switcher: Arc<Mutex<ImportModeSwitcher>>,
+    limiter: Option<Arc<RocksIOLimiter>>,
 }
 
 impl<Router: RaftStoreRouter> ImportSSTService<Router> {
@@ -65,14 +59,15 @@ impl<Router: RaftStoreRouter> ImportSSTService<Router> {
             threads,
             importer,
             switcher: Arc::new(Mutex::new(ImportModeSwitcher::new())),
+            limiter: None,
         }
     }
 }
 
 impl<Router: RaftStoreRouter> ImportSst for ImportSSTService<Router> {
     fn switch_mode(
-        &self,
-        ctx: RpcContext,
+        &mut self,
+        ctx: RpcContext<'_>,
         req: SwitchModeRequest,
         sink: UnarySink<SwitchModeResponse>,
     ) {
@@ -81,27 +76,35 @@ impl<Router: RaftStoreRouter> ImportSst for ImportSSTService<Router> {
 
         let res = {
             let mut switcher = self.switcher.lock().unwrap();
+            fn mf(cf: &str, name: &str, v: f64) {
+                CONFIG_ROCKSDB_GAUGE.with_label_values(&[cf, name]).set(v);
+            }
+
             match req.get_mode() {
-                SwitchMode::Normal => switcher.enter_normal_mode(&self.engine),
-                SwitchMode::Import => switcher.enter_import_mode(&self.engine),
+                SwitchMode::Normal => {
+                    switcher.enter_normal_mode(RocksEngine::from_ref(&self.engine), mf)
+                }
+                SwitchMode::Import => {
+                    switcher.enter_import_mode(RocksEngine::from_ref(&self.engine), mf)
+                }
             }
         };
         match res {
-            Ok(_) => info!("switch mode {:?}", req.get_mode()),
-            Err(ref e) => error!("switch mode {:?}: {:?}", req.get_mode(), e),
+            Ok(_) => info!("switch mode"; "mode" => ?req.get_mode()),
+            Err(ref e) => error!("switch mode failed"; "mode" => ?req.get_mode(), "err" => %e),
         }
 
         ctx.spawn(
             future::result(res)
-                .map(|_| SwitchModeResponse::new())
+                .map(|_| SwitchModeResponse::default())
                 .then(move |res| send_rpc_response!(res, sink, label, timer)),
         )
     }
 
     /// Receive SST from client and save the file for later ingesting.
     fn upload(
-        &self,
-        ctx: RpcContext,
+        &mut self,
+        ctx: RpcContext<'_>,
         stream: RequestStream<UploadRequest>,
         sink: ClientStreamingSink<UploadResponse>,
     ) {
@@ -143,10 +146,46 @@ impl<Router: RaftStoreRouter> ImportSst for ImportSSTService<Router> {
                             })
                             .and_then(|mut file| file.finish())
                     })
-                    .map(|_| UploadResponse::new())
+                    .map(|_| UploadResponse::default())
                     .then(move |res| send_rpc_response!(res, sink, label, timer)),
             ),
         )
+    }
+
+    /// Downloads the file and performs key-rewrite for later ingesting.
+    fn download(
+        &mut self,
+        ctx: RpcContext<'_>,
+        req: DownloadRequest,
+        sink: UnarySink<DownloadResponse>,
+    ) {
+        let label = "download";
+        let timer = Instant::now_coarse();
+        let importer = Arc::clone(&self.importer);
+        let limiter = self.limiter.clone();
+
+        ctx.spawn(self.threads.spawn_fn(move || {
+            let res = importer.download::<RocksEngine>(
+                req.get_sst(),
+                req.get_url(),
+                req.get_name(),
+                req.get_rewrite_rule(),
+                limiter,
+            );
+
+            future::result(res)
+                .map_err(Error::from)
+                .map(|range| {
+                    let mut resp = DownloadResponse::default();
+                    if let Some(r) = range {
+                        resp.set_range(r);
+                    } else {
+                        resp.set_is_empty(true);
+                    }
+                    resp
+                })
+                .then(move |res| send_rpc_response!(res, sink, label, timer))
+        }));
     }
 
     /// Ingest the file by sending a raft command to raftstore.
@@ -154,20 +193,25 @@ impl<Router: RaftStoreRouter> ImportSst for ImportSSTService<Router> {
     /// If the ingestion fails because the region is not found or the epoch does
     /// not match, the remaining files will eventually be cleaned up by
     /// CleanupSSTWorker.
-    fn ingest(&self, ctx: RpcContext, mut req: IngestRequest, sink: UnarySink<IngestResponse>) {
+    fn ingest(
+        &mut self,
+        ctx: RpcContext<'_>,
+        mut req: IngestRequest,
+        sink: UnarySink<IngestResponse>,
+    ) {
         let label = "ingest";
         let timer = Instant::now_coarse();
 
         // Make ingest command.
-        let mut ingest = Request::new();
-        ingest.set_cmd_type(CmdType::IngestSST);
+        let mut ingest = Request::default();
+        ingest.set_cmd_type(CmdType::IngestSst);
         ingest.mut_ingest_sst().set_sst(req.take_sst());
         let mut context = req.take_context();
-        let mut header = RaftRequestHeader::new();
+        let mut header = RaftRequestHeader::default();
         header.set_peer(context.take_peer());
         header.set_region_id(context.get_region_id());
         header.set_region_epoch(context.take_region_epoch());
-        let mut cmd = RaftCmdRequest::new();
+        let mut cmd = RaftCmdRequest::default();
         cmd.set_header(header);
         cmd.mut_requests().push(ingest);
 
@@ -181,7 +225,7 @@ impl<Router: RaftStoreRouter> ImportSst for ImportSSTService<Router> {
                 .map_err(Error::from)
                 .then(|res| match res {
                     Ok(mut res) => {
-                        let mut resp = IngestResponse::new();
+                        let mut resp = IngestResponse::default();
                         let mut header = res.response.take_header();
                         if header.has_error() {
                             resp.set_error(header.take_error());
@@ -194,7 +238,12 @@ impl<Router: RaftStoreRouter> ImportSst for ImportSSTService<Router> {
         )
     }
 
-    fn compact(&self, ctx: RpcContext, req: CompactRequest, sink: UnarySink<CompactResponse>) {
+    fn compact(
+        &mut self,
+        ctx: RpcContext<'_>,
+        req: CompactRequest,
+        sink: UnarySink<CompactResponse>,
+    ) {
         let label = "compact";
         let timer = Instant::now_coarse();
         let engine = Arc::clone(&self.engine);
@@ -217,22 +266,55 @@ impl<Router: RaftStoreRouter> ImportSst for ImportSSTService<Router> {
             let res = compact_files_in_range(&engine, start, end, output_level);
             match res {
                 Ok(_) => info!(
-                    "compact files in range [{:?}, {:?}) to level {:?} takes {:?}",
-                    start,
-                    end,
-                    output_level,
-                    timer.elapsed()
+                    "compact files in range";
+                    "start" => start.map(log_wrappers::Key),
+                    "end" => end.map(log_wrappers::Key),
+                    "output_level" => ?output_level, "takes" => ?timer.elapsed()
                 ),
                 Err(ref e) => error!(
-                    "compact files in range [{:?}, {:?}) to level {:?}: {:?}",
-                    start, end, output_level, e
+                    "compact files in range failed";
+                    "start" => start.map(log_wrappers::Key),
+                    "end" => end.map(log_wrappers::Key),
+                    "output_level" => ?output_level, "err" => %e
                 ),
             }
 
             future::result(res)
-                .map_err(Error::from)
-                .map(|_| CompactResponse::new())
+                .map_err(|e| Error::Engine(box_err!(e)))
+                .map(|_| CompactResponse::default())
                 .then(move |res| send_rpc_response!(res, sink, label, timer))
         }))
+    }
+
+    fn set_download_speed_limit(
+        &mut self,
+        ctx: RpcContext<'_>,
+        req: SetDownloadSpeedLimitRequest,
+        sink: UnarySink<SetDownloadSpeedLimitResponse>,
+    ) {
+        let label = "set_download_speed_limit";
+        let timer = Instant::now_coarse();
+
+        let s = i64::try_from(req.get_speed_limit());
+        let s = if let Ok(s) = s {
+            s
+        } else {
+            warn!(
+                "SetDownloadSpeedLimitRequest out of range: {}. Using i64::max_value",
+                req.get_speed_limit()
+            );
+            i64::max_value()
+        };
+
+        match (s, &mut self.limiter) {
+            (0, limiter) => *limiter = None,
+            (s, Some(l)) => l.set_bytes_per_second(s),
+            (s, limiter) => *limiter = Some(Arc::new(RocksIOLimiter::new(s))),
+        }
+
+        ctx.spawn(
+            future::ok::<_, ()>(SetDownloadSpeedLimitResponse::default())
+                .then(move |res| send_rpc_response!(res, sink, label, timer)),
+        )
     }
 }

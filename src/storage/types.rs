@@ -1,37 +1,15 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 //! Core data types.
 
-use std::cmp::Ordering;
-use std::fmt::{self, Display, Formatter};
-use std::hash::{Hash, Hasher};
-use std::u64;
+use crate::storage::{
+    mvcc::{Lock, TimeStamp, Write},
+    Callback, Command, Error as StorageError, Result,
+};
+use kvproto::kvrpcpb::LockInfo;
+use std::fmt::Debug;
 
-use util::codec::bytes;
-use util::codec::number::{self, NumberEncoder};
-use util::{codec, escape};
-
-use storage::mvcc::{Lock, Write};
-
-/// Value type which is essentially raw bytes.
-pub type Value = Vec<u8>;
-
-/// Key-value pair type.
-///
-/// The value is simply raw bytes; the key is a little bit tricky, which is
-/// encoded bytes.
-pub type KvPair = (Vec<u8>, Value);
+pub use keys::{Key, KvPair, Value};
 
 /// `MvccInfo` stores all mvcc information of given key.
 /// Used by `MvccGetByKey` and `MvccGetByStartTs`.
@@ -39,150 +17,139 @@ pub type KvPair = (Vec<u8>, Value);
 pub struct MvccInfo {
     pub lock: Option<Lock>,
     /// commit_ts and write
-    pub writes: Vec<(u64, Write)>,
+    pub writes: Vec<(TimeStamp, Write)>,
     /// start_ts and value
-    pub values: Vec<(u64, Value)>,
+    pub values: Vec<(TimeStamp, Value)>,
 }
 
-/// The caller should ensure the key is a timestamped key.
-pub fn truncate_ts(key: &[u8]) -> &[u8] {
-    &key[..key.len() - number::U64_SIZE]
-}
-
-/// Key type.
-///
-/// Keys have 2 types of binary representation - raw and encoded. The raw
-/// representation is for public interface, the encoded representation is for
-/// internal storage. We can get both representations from an instance of this
-/// type.
-///
-/// Orthogonal to binary representation, keys may or may not embed a timestamp,
-/// but this information is transparent to this type, the caller must use it
-/// consistently.
+/// A row mutation.
 #[derive(Debug, Clone)]
-pub struct Key(Vec<u8>);
-
-/// Core functions for `Key`.
-impl Key {
-    /// Creates a key from raw bytes.
-    pub fn from_raw(key: &[u8]) -> Key {
-        Key(codec::bytes::encode_bytes(key))
-    }
-
-    /// Gets the raw representation of this key.
-    pub fn raw(&self) -> Result<Vec<u8>, codec::Error> {
-        bytes::decode_bytes(&mut self.0.as_slice(), false)
-    }
-
-    /// Creates a key from encoded bytes.
-    pub fn from_encoded(encoded_key: Vec<u8>) -> Key {
-        Key(encoded_key)
-    }
-
-    /// Gets the encoded representation of this key.
-    pub fn encoded(&self) -> &Vec<u8> {
-        &self.0
-    }
-
-    /// Creates a new key by appending a `u64` timestamp to this key.
-    pub fn append_ts(&self, ts: u64) -> Key {
-        let mut encoded = self.0.clone();
-        encoded.encode_u64_desc(ts).unwrap();
-        Key(encoded)
-    }
-
-    /// Gets the timestamp contained in this key.
+pub enum Mutation {
+    /// Put `Value` into `Key`, overwriting any existing value.
+    Put((Key, Value)),
+    /// Delete `Key`.
+    Delete(Key),
+    /// Set a lock on `Key`.
+    Lock(Key),
+    /// Put `Value` into `Key` if `Key` does not yet exist.
     ///
-    /// Preconditions: the caller must ensure this is actually a timestamped
-    /// key.
-    pub fn decode_ts(&self) -> Result<u64, codec::Error> {
-        let len = self.0.len();
-        if len < number::U64_SIZE {
-            // TODO: IMHO, this should be an assertion failure instead of
-            // returning an error. If this happens, it indicates a bug in
-            // the caller module, have to make code change to fix it.
-            //
-            // Even if it passed the length check, it still could be buggy,
-            // a better way is to introduce a type `TimestampedKey`, and
-            // functions to convert between `TimestampedKey` and `Key`.
-            // `TimestampedKey` is in a higher (MVCC) layer, while `Key` is
-            // in the core storage engine layer.
-            Err(codec::Error::KeyLength)
-        } else {
-            let mut ts = &self.0[len - number::U64_SIZE..];
-            Ok(number::decode_u64_desc(&mut ts)?)
+    /// Returns [`KeyError::AlreadyExists`](kvproto::kvrpcpb::KeyError::AlreadyExists) if the key already exists.
+    Insert((Key, Value)),
+}
+
+impl Mutation {
+    pub fn key(&self) -> &Key {
+        match self {
+            Mutation::Put((ref key, _)) => key,
+            Mutation::Delete(ref key) => key,
+            Mutation::Lock(ref key) => key,
+            Mutation::Insert((ref key, _)) => key,
         }
     }
 
-    /// Creates a new key by truncating the timestamp from this key.
-    ///
-    /// Preconditions: the caller must ensure this is actually a timestamped key.
-    pub fn truncate_ts(&self) -> Result<Key, codec::Error> {
-        let len = self.0.len();
-        if len < number::U64_SIZE {
-            // TODO: (the same as above)
-            return Err(codec::Error::KeyLength);
+    pub fn into_key_value(self) -> (Key, Option<Value>) {
+        match self {
+            Mutation::Put((key, value)) => (key, Some(value)),
+            Mutation::Delete(key) => (key, None),
+            Mutation::Lock(key) => (key, None),
+            Mutation::Insert((key, value)) => (key, Some(value)),
         }
-        Ok(Key::from_encoded(truncate_ts(&self.0).to_vec()))
+    }
+
+    pub fn is_insert(&self) -> bool {
+        match self {
+            Mutation::Insert(_) => true,
+            _ => false,
+        }
     }
 }
 
-/// Hash for `Key`.
-impl Hash for Key {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.encoded().hash(state)
+/// Represents the status of a transaction.
+#[derive(PartialEq, Debug)]
+pub enum TxnStatus {
+    /// The txn was already rolled back before.
+    Rollbacked,
+    /// The txn is just rolled back due to expiration.
+    TtlExpire,
+    /// The txn is just rolled back due to lock not exist.
+    LockNotExist,
+    /// The txn haven't yet been committed.
+    Uncommitted {
+        lock_ttl: u64,
+        min_commit_ts: TimeStamp,
+    },
+    /// The txn was committed.
+    Committed { commit_ts: TimeStamp },
+}
+
+impl TxnStatus {
+    pub fn uncommitted(lock_ttl: u64, min_commit_ts: TimeStamp) -> Self {
+        Self::Uncommitted {
+            lock_ttl,
+            min_commit_ts,
+        }
+    }
+
+    pub fn committed(commit_ts: TimeStamp) -> Self {
+        Self::Committed { commit_ts }
     }
 }
 
-/// Display for `Key`.
-impl Display for Key {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "{}", escape(&self.0))
-    }
+pub enum StorageCallback {
+    Boolean(Callback<()>),
+    Booleans(Callback<Vec<Result<()>>>),
+    MvccInfoByKey(Callback<MvccInfo>),
+    MvccInfoByStartTs(Callback<Option<(Key, MvccInfo)>>),
+    Locks(Callback<Vec<LockInfo>>),
+    TxnStatus(Callback<TxnStatus>),
 }
 
-/// Partial equality for `Key`.
-impl PartialEq for Key {
-    fn eq(&self, other: &Key) -> bool {
-        self.0 == other.0
-    }
+/// Process result of a command.
+pub enum ProcessResult {
+    Res,
+    MultiRes { results: Vec<Result<()>> },
+    MvccKey { mvcc: MvccInfo },
+    MvccStartTs { mvcc: Option<(Key, MvccInfo)> },
+    Locks { locks: Vec<LockInfo> },
+    TxnStatus { txn_status: TxnStatus },
+    NextCommand { cmd: Command },
+    Failed { err: StorageError },
 }
 
-impl PartialOrd for Key {
-    fn partial_cmp(&self, other: &Key) -> Option<Ordering> {
-        Some(self.0.cmp(&other.0))
-    }
-}
-
-/// Creates a new key from raw bytes.
-pub fn make_key(k: &[u8]) -> Key {
-    Key::from_raw(k)
-}
-
-/// Splits encoded key on timestamp.
-/// Returns the split key and timestamp.
-pub fn split_encoded_key_on_ts(key: &[u8]) -> Result<(&[u8], u64), codec::Error> {
-    if key.len() < number::U64_SIZE {
-        Err(codec::Error::KeyLength)
-    } else {
-        let pos = key.len() - number::U64_SIZE;
-        let k = &key[..pos];
-        let mut ts = &key[pos..];
-        Ok((k, number::decode_u64_desc(&mut ts)?))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_split_ts() {
-        let k = b"k";
-        let ts = 123;
-        assert!(split_encoded_key_on_ts(k).is_err());
-        let enc = Key::from_encoded(k.to_vec()).append_ts(ts);
-        let res = split_encoded_key_on_ts(enc.encoded()).unwrap();
-        assert_eq!(res, (k.as_ref(), ts));
+impl StorageCallback {
+    /// Delivers the process result of a command to the storage callback.
+    pub fn execute(self, pr: ProcessResult) {
+        match self {
+            StorageCallback::Boolean(cb) => match pr {
+                ProcessResult::Res => cb(Ok(())),
+                ProcessResult::Failed { err } => cb(Err(err)),
+                _ => panic!("process result mismatch"),
+            },
+            StorageCallback::Booleans(cb) => match pr {
+                ProcessResult::MultiRes { results } => cb(Ok(results)),
+                ProcessResult::Failed { err } => cb(Err(err)),
+                _ => panic!("process result mismatch"),
+            },
+            StorageCallback::MvccInfoByKey(cb) => match pr {
+                ProcessResult::MvccKey { mvcc } => cb(Ok(mvcc)),
+                ProcessResult::Failed { err } => cb(Err(err)),
+                _ => panic!("process result mismatch"),
+            },
+            StorageCallback::MvccInfoByStartTs(cb) => match pr {
+                ProcessResult::MvccStartTs { mvcc } => cb(Ok(mvcc)),
+                ProcessResult::Failed { err } => cb(Err(err)),
+                _ => panic!("process result mismatch"),
+            },
+            StorageCallback::Locks(cb) => match pr {
+                ProcessResult::Locks { locks } => cb(Ok(locks)),
+                ProcessResult::Failed { err } => cb(Err(err)),
+                _ => panic!("process result mismatch"),
+            },
+            StorageCallback::TxnStatus(cb) => match pr {
+                ProcessResult::TxnStatus { txn_status } => cb(Ok(txn_status)),
+                ProcessResult::Failed { err } => cb(Err(err)),
+                _ => panic!("process result mismatch"),
+            },
+        }
     }
 }

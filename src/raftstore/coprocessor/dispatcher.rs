@@ -1,23 +1,12 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
-use rocksdb::DB;
-
+use engine::rocks::DB;
 use kvproto::metapb::Region;
+use kvproto::pdpb::CheckPolicy;
 use kvproto::raft_cmdpb::{RaftCmdRequest, RaftCmdResponse};
+use std::mem;
 
-use raftstore::store::msg::Msg;
-use util::transport::{RetryableSendCh, Sender};
+use crate::raftstore::store::CasualRouter;
 
 use super::*;
 
@@ -27,10 +16,11 @@ struct Entry<T> {
 }
 
 // TODO: change it to Send + Clone.
-pub type BoxAdminObserver = Box<AdminObserver + Send + Sync>;
-pub type BoxQueryObserver = Box<QueryObserver + Send + Sync>;
-pub type BoxSplitCheckObserver = Box<SplitCheckObserver + Send + Sync>;
-pub type BoxRoleObserver = Box<RoleObserver + Send + Sync>;
+pub type BoxAdminObserver = Box<dyn AdminObserver + Send + Sync>;
+pub type BoxQueryObserver = Box<dyn QueryObserver + Send + Sync>;
+pub type BoxSplitCheckObserver = Box<dyn SplitCheckObserver + Send + Sync>;
+pub type BoxRoleObserver = Box<dyn RoleObserver + Send + Sync>;
+pub type BoxRegionChangeObserver = Box<dyn RegionChangeObserver + Send + Sync>;
 
 /// Registry contains all registered coprocessors.
 #[derive(Default)]
@@ -39,6 +29,7 @@ pub struct Registry {
     query_observers: Vec<Entry<BoxQueryObserver>>,
     split_check_observers: Vec<Entry<BoxSplitCheckObserver>>,
     role_observers: Vec<Entry<BoxRoleObserver>>,
+    region_change_observers: Vec<Entry<BoxRegionChangeObserver>>,
     // TODO: add endpoint
 }
 
@@ -70,6 +61,10 @@ impl Registry {
 
     pub fn register_role_observer(&mut self, priority: u32, ro: BoxRoleObserver) {
         push!(priority, ro, self.role_observers);
+    }
+
+    pub fn register_region_change_observer(&mut self, priority: u32, rlo: BoxRegionChangeObserver) {
+        push!(priority, rlo, self.region_change_observers);
     }
 }
 
@@ -124,14 +119,23 @@ pub struct CoprocessorHost {
 }
 
 impl CoprocessorHost {
-    pub fn new<C: Sender<Msg> + Send + Sync + 'static>(
-        cfg: Config,
-        ch: RetryableSendCh<Msg, C>,
-    ) -> CoprocessorHost {
+    pub fn new<C: CasualRouter + Clone + Send + 'static>(cfg: Config, ch: C) -> CoprocessorHost {
         let mut registry = Registry::default();
-        let split_size_check_observer =
-            SizeCheckObserver::new(cfg.region_max_size.0, cfg.region_split_size.0, ch);
+        let split_size_check_observer = SizeCheckObserver::new(
+            cfg.region_max_size.0,
+            cfg.region_split_size.0,
+            cfg.batch_split_limit,
+            ch.clone(),
+        );
         registry.register_split_check_observer(200, Box::new(split_size_check_observer));
+
+        let split_keys_check_observer = KeysCheckObserver::new(
+            cfg.region_max_keys,
+            cfg.region_split_keys,
+            cfg.batch_split_limit,
+            ch,
+        );
+        registry.register_split_check_observer(200, Box::new(split_keys_check_observer));
 
         // TableCheckObserver has higher priority than SizeCheckObserver.
         registry.register_split_check_observer(
@@ -148,12 +152,15 @@ impl CoprocessorHost {
     pub fn pre_propose(&self, region: &Region, req: &mut RaftCmdRequest) -> Result<()> {
         if !req.has_admin_request() {
             let query = req.mut_requests();
-            try_loop_ob!(
+            let mut vec_query = mem::take(query).into();
+            let result = try_loop_ob!(
                 region,
                 &self.registry.query_observers,
                 pre_propose_query,
-                query
-            )
+                &mut vec_query,
+            );
+            *query = vec_query.into();
+            result
         } else {
             let admin = req.mut_admin_request();
             try_loop_ob!(
@@ -173,7 +180,7 @@ impl CoprocessorHost {
                 region,
                 &self.registry.query_observers,
                 pre_apply_query,
-                query
+                query,
             );
         } else {
             let admin = req.get_admin_request();
@@ -189,12 +196,14 @@ impl CoprocessorHost {
     pub fn post_apply(&self, region: &Region, resp: &mut RaftCmdResponse) {
         if !resp.has_admin_response() {
             let query = resp.mut_responses();
+            let mut vec_query = mem::take(query).into();
             loop_ob!(
                 region,
                 &self.registry.query_observers,
                 post_apply_query,
-                query
+                &mut vec_query,
             );
+            *query = vec_query.into();
         } else {
             let admin = resp.mut_admin_response();
             loop_ob!(
@@ -211,6 +220,7 @@ impl CoprocessorHost {
         region: &Region,
         engine: &DB,
         auto_split: bool,
+        policy: CheckPolicy,
     ) -> SplitCheckerHost {
         let mut host = SplitCheckerHost::new(auto_split);
         loop_ob!(
@@ -218,13 +228,24 @@ impl CoprocessorHost {
             &self.registry.split_check_observers,
             add_checker,
             &mut host,
-            engine
+            engine,
+            policy
         );
         host
     }
 
     pub fn on_role_change(&self, region: &Region, role: StateRole) {
         loop_ob!(region, &self.registry.role_observers, on_role_change, role);
+    }
+
+    pub fn on_region_changed(&self, region: &Region, event: RegionChangeEvent, role: StateRole) {
+        loop_ob!(
+            region,
+            &self.registry.region_change_observers,
+            on_region_changed,
+            event,
+            role
+        );
     }
 
     pub fn shutdown(&self) {
@@ -241,9 +262,8 @@ impl CoprocessorHost {
 }
 
 #[cfg(test)]
-mod test {
-    use protobuf::RepeatedField;
-    use raftstore::coprocessor::*;
+mod tests {
+    use crate::raftstore::coprocessor::*;
     use std::sync::atomic::*;
     use std::sync::*;
 
@@ -262,7 +282,11 @@ mod test {
     impl Coprocessor for TestCoprocessor {}
 
     impl AdminObserver for TestCoprocessor {
-        fn pre_propose_admin(&self, ctx: &mut ObserverContext, _: &mut AdminRequest) -> Result<()> {
+        fn pre_propose_admin(
+            &self,
+            ctx: &mut ObserverContext<'_>,
+            _: &mut AdminRequest,
+        ) -> Result<()> {
             self.called.fetch_add(1, Ordering::SeqCst);
             ctx.bypass = self.bypass.load(Ordering::SeqCst);
             if self.return_err.load(Ordering::SeqCst) {
@@ -271,12 +295,12 @@ mod test {
             Ok(())
         }
 
-        fn pre_apply_admin(&self, ctx: &mut ObserverContext, _: &AdminRequest) {
+        fn pre_apply_admin(&self, ctx: &mut ObserverContext<'_>, _: &AdminRequest) {
             self.called.fetch_add(2, Ordering::SeqCst);
             ctx.bypass = self.bypass.load(Ordering::SeqCst);
         }
 
-        fn post_apply_admin(&self, ctx: &mut ObserverContext, _: &mut AdminResponse) {
+        fn post_apply_admin(&self, ctx: &mut ObserverContext<'_>, _: &mut AdminResponse) {
             self.called.fetch_add(3, Ordering::SeqCst);
             ctx.bypass = self.bypass.load(Ordering::SeqCst);
         }
@@ -285,8 +309,8 @@ mod test {
     impl QueryObserver for TestCoprocessor {
         fn pre_propose_query(
             &self,
-            ctx: &mut ObserverContext,
-            _: &mut RepeatedField<Request>,
+            ctx: &mut ObserverContext<'_>,
+            _: &mut Vec<Request>,
         ) -> Result<()> {
             self.called.fetch_add(4, Ordering::SeqCst);
             ctx.bypass = self.bypass.load(Ordering::SeqCst);
@@ -296,20 +320,32 @@ mod test {
             Ok(())
         }
 
-        fn pre_apply_query(&self, ctx: &mut ObserverContext, _: &[Request]) {
+        fn pre_apply_query(&self, ctx: &mut ObserverContext<'_>, _: &[Request]) {
             self.called.fetch_add(5, Ordering::SeqCst);
             ctx.bypass = self.bypass.load(Ordering::SeqCst);
         }
 
-        fn post_apply_query(&self, ctx: &mut ObserverContext, _: &mut RepeatedField<Response>) {
+        fn post_apply_query(&self, ctx: &mut ObserverContext<'_>, _: &mut Vec<Response>) {
             self.called.fetch_add(6, Ordering::SeqCst);
             ctx.bypass = self.bypass.load(Ordering::SeqCst);
         }
     }
 
     impl RoleObserver for TestCoprocessor {
-        fn on_role_change(&self, ctx: &mut ObserverContext, _: StateRole) {
+        fn on_role_change(&self, ctx: &mut ObserverContext<'_>, _: StateRole) {
             self.called.fetch_add(7, Ordering::SeqCst);
+            ctx.bypass = self.bypass.load(Ordering::SeqCst);
+        }
+    }
+
+    impl RegionChangeObserver for TestCoprocessor {
+        fn on_region_changed(
+            &self,
+            ctx: &mut ObserverContext<'_>,
+            _: RegionChangeEvent,
+            _: StateRole,
+        ) {
+            self.called.fetch_add(8, Ordering::SeqCst);
             ctx.bypass = self.bypass.load(Ordering::SeqCst);
         }
     }
@@ -340,29 +376,34 @@ mod test {
             .register_query_observer(1, Box::new(ob.clone()));
         host.registry
             .register_role_observer(1, Box::new(ob.clone()));
-        let region = Region::new();
-        let mut admin_req = RaftCmdRequest::new();
-        admin_req.set_admin_request(AdminRequest::new());
+        host.registry
+            .register_region_change_observer(1, Box::new(ob.clone()));
+        let region = Region::default();
+        let mut admin_req = RaftCmdRequest::default();
+        admin_req.set_admin_request(AdminRequest::default());
         host.pre_propose(&region, &mut admin_req).unwrap();
         assert_all!(&[&ob.called], &[1]);
         host.pre_apply(&region, &admin_req);
         assert_all!(&[&ob.called], &[3]);
-        let mut admin_resp = RaftCmdResponse::new();
-        admin_resp.set_admin_response(AdminResponse::new());
+        let mut admin_resp = RaftCmdResponse::default();
+        admin_resp.set_admin_response(AdminResponse::default());
         host.post_apply(&region, &mut admin_resp);
         assert_all!(&[&ob.called], &[6]);
 
-        let mut query_req = RaftCmdRequest::new();
-        query_req.set_requests(RepeatedField::from_vec(vec![Request::new()]));
+        let mut query_req = RaftCmdRequest::default();
+        query_req.set_requests(vec![Request::default()].into());
         host.pre_propose(&region, &mut query_req).unwrap();
         assert_all!(&[&ob.called], &[10]);
         host.pre_apply(&region, &query_req);
         assert_all!(&[&ob.called], &[15]);
-        host.post_apply(&region, &mut RaftCmdResponse::new());
+        host.post_apply(&region, &mut RaftCmdResponse::default());
         assert_all!(&[&ob.called], &[21]);
 
         host.on_role_change(&region, StateRole::Leader);
         assert_all!(&[&ob.called], &[28]);
+
+        host.on_region_changed(&region, RegionChangeEvent::Create, StateRole::Follower);
+        assert_all!(&[&ob.called], &[36]);
     }
 
     #[test]
@@ -380,13 +421,13 @@ mod test {
         host.registry
             .register_query_observer(2, Box::new(ob2.clone()));
 
-        let region = Region::new();
-        let mut admin_req = RaftCmdRequest::new();
-        admin_req.set_admin_request(AdminRequest::new());
-        let mut admin_resp = RaftCmdResponse::new();
-        admin_resp.set_admin_response(AdminResponse::new());
-        let query_req = RaftCmdRequest::new();
-        let query_resp = RaftCmdResponse::new();
+        let region = Region::default();
+        let mut admin_req = RaftCmdRequest::default();
+        admin_req.set_admin_request(AdminRequest::default());
+        let mut admin_resp = RaftCmdResponse::default();
+        admin_resp.set_admin_response(AdminResponse::default());
+        let query_req = RaftCmdRequest::default();
+        let query_resp = RaftCmdResponse::default();
 
         let cases = vec![(0, admin_req, admin_resp), (3, query_req, query_resp)];
 

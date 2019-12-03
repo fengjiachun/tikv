@@ -1,68 +1,62 @@
-// Copyright 2016 PingCAP, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Copyright 2016 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fmt::{self, Display, Formatter};
+use std::mem;
 use std::sync::Arc;
 
+use engine::rocks::DBIterator;
+use engine::{CfName, CF_WRITE, LARGE_CFS};
+use engine::{IterOption, Iterable, DB};
 use kvproto::metapb::Region;
 use kvproto::metapb::RegionEpoch;
 use kvproto::pdpb::CheckPolicy;
-use rocksdb::{DBIterator, DB};
 
-use raftstore::coprocessor::CoprocessorHost;
-use raftstore::store::engine::{IterOption, Iterable};
-use raftstore::store::{keys, Callback, Msg};
-use raftstore::Result;
-use storage::{CfName, LARGE_CFS};
-use util::escape;
-use util::transport::{RetryableSendCh, Sender};
-use util::worker::Runnable;
+use crate::raftstore::coprocessor::CoprocessorHost;
+use crate::raftstore::coprocessor::SplitCheckerHost;
+use crate::raftstore::store::{keys, Callback, CasualMessage, CasualRouter};
+use crate::raftstore::Result;
+use tikv_util::keybuilder::KeyBuilder;
+use tikv_util::worker::Runnable;
 
 use super::metrics::*;
 
 #[derive(PartialEq, Eq)]
-struct KeyEntry {
-    key: Option<Vec<u8>>,
+pub struct KeyEntry {
+    key: Vec<u8>,
     pos: usize,
     value_size: usize,
+    cf: CfName,
 }
 
 impl KeyEntry {
-    fn new(key: Vec<u8>, pos: usize, value_size: usize) -> KeyEntry {
+    pub fn new(key: Vec<u8>, pos: usize, value_size: usize, cf: CfName) -> KeyEntry {
         KeyEntry {
-            key: Some(key),
+            key,
             pos,
             value_size,
+            cf,
         }
     }
 
-    fn take(&mut self) -> KeyEntry {
-        KeyEntry::new(self.key.take().unwrap(), self.pos, self.value_size)
+    pub fn key(&self) -> &[u8] {
+        self.key.as_ref()
+    }
+
+    pub fn is_commit_version(&self) -> bool {
+        self.cf == CF_WRITE
+    }
+
+    pub fn entry_size(&self) -> usize {
+        self.value_size + self.key.len()
     }
 }
 
 impl PartialOrd for KeyEntry {
     fn partial_cmp(&self, rhs: &KeyEntry) -> Option<Ordering> {
         // BinaryHeap is max heap, so we have to reverse order to get a min heap.
-        Some(
-            self.key
-                .as_ref()
-                .unwrap()
-                .cmp(rhs.key.as_ref().unwrap())
-                .reverse(),
-        )
+        Some(self.key.cmp(&rhs.key).reverse())
     }
 }
 
@@ -73,7 +67,7 @@ impl Ord for KeyEntry {
 }
 
 struct MergedIterator<'a> {
-    iters: Vec<DBIterator<&'a DB>>,
+    iters: Vec<(CfName, DBIterator<&'a DB>)>,
     heap: BinaryHeap<KeyEntry>,
 }
 
@@ -87,14 +81,22 @@ impl<'a> MergedIterator<'a> {
     ) -> Result<MergedIterator<'a>> {
         let mut iters = Vec::with_capacity(cfs.len());
         let mut heap = BinaryHeap::with_capacity(cfs.len());
-        for (pos, cf) in cfs.into_iter().enumerate() {
-            let iter_opt =
-                IterOption::new(Some(start_key.to_vec()), Some(end_key.to_vec()), fill_cache);
+        for (pos, cf) in cfs.iter().enumerate() {
+            let iter_opt = IterOption::new(
+                Some(KeyBuilder::from_slice(start_key, 0, 0)),
+                Some(KeyBuilder::from_slice(end_key, 0, 0)),
+                fill_cache,
+            );
             let mut iter = db.new_iterator_cf(cf, iter_opt)?;
             if iter.seek(start_key.into()) {
-                heap.push(KeyEntry::new(iter.key().to_vec(), pos, iter.value().len()));
+                heap.push(KeyEntry::new(
+                    iter.key().to_vec(),
+                    pos,
+                    iter.value().len(),
+                    *cf,
+                ));
             }
-            iters.push(iter);
+            iters.push((*cf, iter));
         }
         Ok(MergedIterator { iters, heap })
     }
@@ -104,14 +106,13 @@ impl<'a> MergedIterator<'a> {
             None => return None,
             Some(e) => e.pos,
         };
-        let iter = &mut self.iters[pos];
+        let (cf, iter) = &mut self.iters[pos];
         if iter.next() {
             // TODO: avoid copy key.
-            let e = KeyEntry::new(iter.key().to_vec(), pos, iter.value().len());
+            let mut e = KeyEntry::new(iter.key().to_vec(), pos, iter.value().len(), cf);
             let mut front = self.heap.peek_mut().unwrap();
-            let res = front.take();
-            *front = e;
-            Some(res)
+            mem::swap(&mut e, &mut front);
+            Some(e)
         } else {
             self.heap.pop()
         }
@@ -136,7 +137,7 @@ impl Task {
 }
 
 impl Display for Task {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "Split Check Task for {}, auto_split: {:?}",
@@ -146,91 +147,85 @@ impl Display for Task {
     }
 }
 
-pub struct Runner<C> {
+pub struct Runner<S> {
     engine: Arc<DB>,
-    ch: RetryableSendCh<Msg, C>,
+    router: S,
     coprocessor: Arc<CoprocessorHost>,
 }
 
-impl<C: Sender<Msg>> Runner<C> {
-    pub fn new(
-        engine: Arc<DB>,
-        ch: RetryableSendCh<Msg, C>,
-        coprocessor: Arc<CoprocessorHost>,
-    ) -> Runner<C> {
+impl<S: CasualRouter> Runner<S> {
+    pub fn new(engine: Arc<DB>, router: S, coprocessor: Arc<CoprocessorHost>) -> Runner<S> {
         Runner {
             engine,
-            ch,
+            router,
             coprocessor,
         }
     }
 
+    /// Checks a Region with split checkers to produce split keys and generates split admin command.
     fn check_split(&mut self, task: Task) {
         let region = &task.region;
         let region_id = region.get_id();
         let start_key = keys::enc_start_key(region);
         let end_key = keys::enc_end_key(region);
         debug!(
-            "[region {}] executing task {} {}",
-            region_id,
-            escape(&start_key),
-            escape(&end_key)
+            "executing task";
+            "region_id" => region_id,
+            "start_key" => log_wrappers::Key(&start_key),
+            "end_key" => log_wrappers::Key(&end_key),
         );
         CHECK_SPILT_COUNTER_VEC.with_label_values(&["all"]).inc();
 
-        let mut host =
-            self.coprocessor
-                .new_split_checker_host(region, &self.engine, task.auto_split);
+        let mut host = self.coprocessor.new_split_checker_host(
+            region,
+            &self.engine,
+            task.auto_split,
+            task.policy,
+        );
         if host.skip() {
-            debug!("[region {}] skip split check", region.get_id());
+            debug!("skip split check"; "region_id" => region.get_id());
             return;
         }
 
-        let split_key = match task.policy {
-            CheckPolicy::SCAN => {
-                let timer = CHECK_SPILT_HISTOGRAM.start_coarse_timer();
-                let res = MergedIterator::new(
-                    self.engine.as_ref(),
-                    LARGE_CFS,
-                    &start_key,
-                    &end_key,
-                    false,
-                ).map(|mut iter| {
-                    while let Some(e) = iter.next() {
-                        if host.on_kv(region, e.key.as_ref().unwrap(), e.value_size as u64) {
-                            break;
+        let split_keys = match host.policy() {
+            CheckPolicy::Scan => {
+                match self.scan_split_keys(&mut host, region, &start_key, &end_key) {
+                    Ok(keys) => keys,
+                    Err(e) => {
+                        error!("failed to scan split key"; "region_id" => region_id, "err" => %e);
+                        return;
+                    }
+                }
+            }
+            CheckPolicy::Approximate => match host.approximate_split_keys(region, &self.engine) {
+                Ok(keys) => keys
+                    .into_iter()
+                    .map(|k| keys::origin_key(&k).to_vec())
+                    .collect(),
+                Err(e) => {
+                    error!(
+                        "failed to get approximate split key, try scan way";
+                        "region_id" => region_id,
+                        "err" => %e,
+                    );
+                    match self.scan_split_keys(&mut host, region, &start_key, &end_key) {
+                        Ok(keys) => keys,
+                        Err(e) => {
+                            error!("failed to scan split key"; "region_id" => region_id, "err" => %e);
+                            return;
                         }
                     }
-                });
-                timer.observe_duration();
-
-                if let Err(e) = res {
-                    error!("[region {}] failed to scan split key: {}", region_id, e);
-                    return;
                 }
-
-                host.split_key()
-            }
-            CheckPolicy::APPROXIMATE => {
-                let res = host.approximate_split_key(region, &self.engine);
-                if let Err(e) = res {
-                    error!(
-                        "[region {}] failed to get approxiamte split key: {}",
-                        region_id, e
-                    );
-                    return;
-                }
-                res.unwrap()
-            }
+            },
+            CheckPolicy::Usekey => vec![], // Handled by pd worker directly.
         };
 
-        if let Some(key) = split_key {
+        if !split_keys.is_empty() {
             let region_epoch = region.get_region_epoch().clone();
-            let res = self
-                .ch
-                .try_send(new_split_region(region_id, region_epoch, key));
+            let msg = new_split_region(region_epoch, split_keys);
+            let res = self.router.send(region_id, msg);
             if let Err(e) = res {
-                warn!("[region {}] failed to send check result: {}", region_id, e);
+                warn!("failed to send check result"; "region_id" => region_id, "err" => %e);
             }
 
             CHECK_SPILT_COUNTER_VEC
@@ -238,27 +233,68 @@ impl<C: Sender<Msg>> Runner<C> {
                 .inc();
         } else {
             debug!(
-                "[region {}] no need to send, split key not found",
-                region_id,
+                "no need to send, split key not found";
+                "region_id" => region_id,
             );
 
             CHECK_SPILT_COUNTER_VEC.with_label_values(&["ignore"]).inc();
         }
     }
+
+    /// Gets the split keys by scanning the range.
+    fn scan_split_keys(
+        &mut self,
+        host: &mut SplitCheckerHost,
+        region: &Region,
+        start_key: &[u8],
+        end_key: &[u8],
+    ) -> Result<Vec<Vec<u8>>> {
+        let timer = CHECK_SPILT_HISTOGRAM.start_coarse_timer();
+        MergedIterator::new(self.engine.as_ref(), LARGE_CFS, start_key, end_key, false).map(
+            |mut iter| {
+                let mut size = 0;
+                let mut keys = 0;
+                while let Some(e) = iter.next() {
+                    if host.on_kv(region, &e) {
+                        return;
+                    }
+                    size += e.entry_size() as u64;
+                    keys += 1;
+                }
+
+                // if we scan the whole range, we can update approximate size and keys with accurate value.
+                info!(
+                    "update approximate size and keys with accurate value";
+                    "region_id" => region.get_id(),
+                    "size" => size,
+                    "keys" => keys,
+                );
+                let _ = self.router.send(
+                    region.get_id(),
+                    CasualMessage::RegionApproximateSize { size },
+                );
+                let _ = self.router.send(
+                    region.get_id(),
+                    CasualMessage::RegionApproximateKeys { keys },
+                );
+            },
+        )?;
+        timer.observe_duration();
+
+        Ok(host.split_keys())
+    }
 }
 
-impl<C: Sender<Msg>> Runnable<Task> for Runner<C> {
+impl<S: CasualRouter> Runnable<Task> for Runner<S> {
     fn run(&mut self, task: Task) {
         self.check_split(task);
     }
 }
 
-fn new_split_region(region_id: u64, region_epoch: RegionEpoch, key: Vec<u8>) -> Msg {
-    let split_key = keys::origin_key(key.as_slice()).to_vec();
-    Msg::SplitRegion {
-        region_id,
+fn new_split_region(region_epoch: RegionEpoch, split_keys: Vec<Vec<u8>>) -> CasualMessage {
+    CasualMessage::SplitRegion {
         region_epoch,
-        split_key,
+        split_keys,
         callback: Callback::None,
     }
 }
